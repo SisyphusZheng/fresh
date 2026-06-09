@@ -52,11 +52,15 @@ with workspace members in `packages/*` and `www/`.
 
 ### Lockfile quirks
 
-The lockfile contains remote specifiers pointing to `refs/heads/main` (e.g.
-`raw.githubusercontent.com/.../refs/heads/main/...`). These hashes go stale when
-upstream pushes. When that happens, manually update the hash in `deno.lock`
-since `deno cache --reload` cannot fix it (see
-https://github.com/denoland/deno/issues/32991).
+The lockfile may contain unpinned remote specifiers whose content can change
+(known limitation, see https://github.com/denoland/deno/issues/32991). If
+`deno install` fails with an integrity check error, run:
+
+    deno install --lock-write
+
+This tells Deno to accept the new content and update the lockfile. The
+`--reload` flag alone is not sufficient here because it re-fetches content but
+still validates against the existing lockfile integrity.
 
 ## Architecture
 
