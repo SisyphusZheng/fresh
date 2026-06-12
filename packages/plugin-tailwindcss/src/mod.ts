@@ -1,5 +1,5 @@
 import type { Builder } from "fresh/dev";
-import twPostcss from "@tailwindcss/postcss";
+import { postcss as twPostcss } from "@tailwindcss/postcss";
 import postcss from "postcss";
 import type { TailwindPluginOptions } from "./types.ts";
 
