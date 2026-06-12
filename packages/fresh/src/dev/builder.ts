@@ -171,7 +171,7 @@ export class Builder<State = any> {
   ): Promise<void> {
     // Run update check in background
     updateCheck(UPDATE_INTERVAL).catch((e) =>
-      console.debug("Update check failed:", e),
+      console.warn("Update check failed:", e),
     );
 
     this.config.mode = "development";
