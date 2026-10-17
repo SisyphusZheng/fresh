@@ -217,6 +217,33 @@ Deno.test("App - wrong method match", async () => {
   expect(await res.text()).toEqual("ok");
 });
 
+Deno.test("App - non-standard method does not crash handler", async () => {
+  // Regression test for https://github.com/denoland/fresh/issues/3804
+  // WebDAV scanners (and other clients) routinely send verbs outside the
+  // seven methods Fresh's router declares (GET/POST/PATCH/PUT/DELETE/HEAD/
+  // OPTIONS). Those used to surface as `methodMatch: true` with an
+  // `undefined` item, throwing "handler2 is not a function" in production.
+  const app = new App()
+    .get("/", () => new Response("ok"))
+    .get("/books/:id", (ctx) => new Response(ctx.params.id));
+
+  const server = new FakeServer(app.handler());
+
+  // Static route
+  let res = await server.request(
+    new Request("http://localhost/", { method: "PROPFIND" }),
+  );
+  expect(res.status).toEqual(405);
+  expect(await res.text()).toEqual("Method Not Allowed");
+
+  // Dynamic route
+  res = await server.request(
+    new Request("http://localhost/books/123", { method: "PROPFIND" }),
+  );
+  expect(res.status).toEqual(405);
+  expect(await res.text()).toEqual("Method Not Allowed");
+});
+
 Deno.test("App - methods with middleware", async () => {
   const app = new App<{ text: string }>()
     .use((ctx) => {
@@ -824,7 +851,7 @@ Deno.test("App - .appWrapper()", async () => {
   expect(await res.text()).toContain("<body>app/index<");
 });
 
-Deno.test.ignore("App - .layout()", async () => {
+Deno.test("App - .layout()", async () => {
   const app = new App()
     .layout("/", ({ Component }) => (
       <>
@@ -840,7 +867,6 @@ Deno.test.ignore("App - .layout()", async () => {
 
   const server = new FakeServer(app.handler());
 
-  // The `/foo` layout is not applied for GET `/foo`, is that correct?
   const res = await server.get("/foo");
   expect(await res.text()).toContain("<body>layout/foo/index<");
 });

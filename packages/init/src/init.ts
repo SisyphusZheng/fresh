@@ -5,11 +5,11 @@ import * as semver from "@std/semver";
 import initConfig from "../deno.json" with { type: "json" };
 
 // Keep these as is, as we replace these version in our release script
-const FRESH_VERSION = "2.2.1";
+const FRESH_VERSION = "2.3.3";
 const FRESH_TAILWIND_VERSION = "1.0.0";
-const FRESH_VITE_PLUGIN = "1.0.0";
-const PREACT_VERSION = "10.28.3";
-const PREACT_SIGNALS_VERSION = "2.7.1";
+const FRESH_VITE_PLUGIN = "1.1.2";
+const PREACT_VERSION = "10.29.1";
+const PREACT_SIGNALS_VERSION = "2.9.0";
 const TAILWINDCSS_VERSION = "4.1.10";
 const TAILWINDCSS_POSTCSS_VERSION = "4.1.10";
 const POSTCSS_VERSION = "8.5.6";
@@ -388,7 +388,7 @@ import "./assets/styles.css";`,
   await writeFile("static/logo.svg", STATIC_LOGO);
 
   try {
-    const res = await fetch("https://fresh.deno.dev/favicon.ico");
+    const res = await fetch("https://usefresh.dev/favicon.ico");
     const buf = await res.arrayBuffer();
     await writeFile("static/favicon.ico", new Uint8Array(buf));
   } catch {
@@ -616,6 +616,7 @@ if (Deno.args.includes("build")) {
     denoJson.imports["@fresh/plugin-vite"] =
       `jsr:@fresh/plugin-vite@^${vitePluginVersion}`;
     denoJson.imports["vite"] = "npm:vite@^7.1.3";
+    denoJson.imports["@types/babel__core"] = "npm:@types/babel__core@^7.20.5";
 
     if (useTailwind) {
       denoJson.imports["tailwindcss"] =
@@ -651,7 +652,7 @@ import { fresh } from "@fresh/plugin-vite";\n`;
   const README_MD = `# Fresh project
 
 Your new Fresh project is ready to go. You can follow the Fresh "Getting
-Started" guide here: https://fresh.deno.dev/docs/getting-started
+Started" guide here: https://usefresh.dev/docs/getting-started
 
 ### Usage
 

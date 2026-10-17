@@ -13,6 +13,7 @@ import {
   pathToSpec,
   type PendingStaticFile,
   specToName,
+  toPosix,
   UniqueNamer,
 } from "fresh/internal-dev";
 import {
@@ -23,6 +24,19 @@ import {
 import * as path from "@std/path";
 import { getBuildId } from "./build_id.ts";
 
+const CSS_LANG_REG = /\.(css|less|sass|scss)(\?.*)?$/;
+export const FRESH_CSS_PLACEHOLDER = `["__FRESH_CSS_PLACEHOLDER__"]`;
+
+export function replaceFreshCssPlaceholders(
+  content: string,
+  css: string[] | undefined,
+): string {
+  return content.replaceAll(
+    FRESH_CSS_PLACEHOLDER,
+    css ? JSON.stringify(css.map((href) => `/${href}`)) : "null",
+  );
+}
+
 export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
   const modName = "fresh:server-snapshot";
 
@@ -32,7 +46,6 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
   let clientOutDir = "";
   let serverOutDir = "";
   let root = "";
-  let publicDir = "";
 
   const islands = new Map<string, { name: string; chunk: string | null }>();
   const islandsByFile = new Set<string>();
@@ -56,7 +69,6 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
       configResolved(config) {
         root = config.root;
 
-        publicDir = pathWithRoot(config.publicDir, config.root);
         clientOutDir = pathWithRoot(
           config.environments.client.build.outDir,
           config.root,
@@ -160,17 +172,26 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
             const route = result.routes[i];
             const name = routeNamer.getUniqueName(route.id);
 
-            routeFileToName.set(route.filePath, name);
+            routeFileToName.set(toPosix(route.filePath), name);
             routes.set(name, route);
           }
 
           const staticFiles: PendingStaticFile[] = [];
           let islandMods: IslandModChunk[] = [];
           let clientEntry = "/@id/fresh:client-entry";
+          let hmrClientEntry: string | undefined;
           let buildId = "";
           const entryAssets: string[] = [];
 
           if (isDev && server !== undefined) {
+            // Set hmrClientEntry so the SSR runtime always emits a boot script
+            // in dev, even when a page has zero islands. Without this, edits
+            // to island-free routes never trigger a browser reload because the
+            // `fresh:reload` WebSocket listener is never attached. The value
+            // is used as a marker only — its presence is what matters, not
+            // what it points to.
+            hmrClientEntry = clientEntry;
+
             for (const id of islands.keys()) {
               const mod = server.environments.client.moduleGraph.getModuleById(
                 id,
@@ -221,6 +242,7 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
                 filePath: path.join(clientOutDir, chunk.file),
                 pathname: chunk.file,
                 hash: null,
+                immutable: true,
               });
 
               if (chunk.css !== undefined) {
@@ -233,6 +255,7 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
                     filePath: path.join(clientOutDir, id),
                     hash: null,
                     pathname,
+                    immutable: true,
                   });
 
                   if (chunk.name === clientEntryName) {
@@ -274,9 +297,14 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
               }
             }
 
-            if (await fsAdapter.isDirectory(publicDir)) {
+            // Walk all static directories. First directory wins for
+            // duplicate pathnames.
+            const seenStaticPaths = new Set<string>();
+            for (const dir of options.staticDir) {
+              if (!(await fsAdapter.isDirectory(dir))) continue;
+
               const entries = await fsAdapter.walk(
-                publicDir,
+                dir,
                 {
                   followSymlinks: false,
                   includeDirs: false,
@@ -286,11 +314,16 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
               );
 
               for await (const entry of entries) {
-                const relative = path.relative(publicDir, entry.path);
+                const relative = path.relative(dir, entry.path);
+                if (seenStaticPaths.has(relative)) continue;
+                seenStaticPaths.add(relative);
+
                 const filePath = path.join(clientOutDir, relative);
 
                 try {
-                  await Deno.mkdir(path.dirname(filePath), { recursive: true });
+                  await Deno.mkdir(path.dirname(filePath), {
+                    recursive: true,
+                  });
                 } catch (err) {
                   if (!(err instanceof Deno.errors.AlreadyExists)) {
                     throw err;
@@ -306,16 +339,61 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
 
                 if (path.basename(relative) === "index.html") {
                   const htmlRelative = path.relative(
-                    publicDir,
+                    dir,
                     path.dirname(entry.path),
                   );
 
-                  staticFiles.push({
-                    filePath,
-                    hash: null,
-                    pathname: htmlRelative,
-                  });
+                  if (!seenStaticPaths.has(htmlRelative)) {
+                    seenStaticPaths.add(htmlRelative);
+                    staticFiles.push({
+                      filePath,
+                      hash: null,
+                      pathname: htmlRelative,
+                    });
+                  }
                 }
+              }
+            }
+
+            // Scan client output directory for any additional files generated
+            // by Vite plugins (e.g., vite-plugin-pwa generates sw.js,
+            // manifest.webmanifest) that aren't in the Vite manifest or
+            // public directory.
+            if (await fsAdapter.isDirectory(clientOutDir)) {
+              // Normalize registered pathnames (strip leading /) for comparison
+              const registeredPaths = new Set(
+                staticFiles.map((f) =>
+                  f.pathname.startsWith("/") ? f.pathname.slice(1) : f.pathname
+                ),
+              );
+
+              const clientFiles = await fsAdapter.walk(
+                clientOutDir,
+                {
+                  followSymlinks: false,
+                  includeDirs: false,
+                  includeFiles: true,
+                },
+              );
+
+              for await (const entry of clientFiles) {
+                const relative = path.relative(clientOutDir, entry.path)
+                  .replaceAll("\\", "/");
+
+                // Skip .vite directory and already-registered files
+                if (
+                  relative.startsWith(".vite/") ||
+                  relative === ".vite" ||
+                  registeredPaths.has(relative)
+                ) {
+                  continue;
+                }
+
+                staticFiles.push({
+                  filePath: entry.path,
+                  hash: null,
+                  pathname: relative,
+                });
               }
             }
           }
@@ -325,6 +403,7 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
             staticFiles,
             buildId,
             clientEntry,
+            hmrClientEntry,
             entryAssets,
             fsRoutesFiles: result.routes,
             islands: islandMods,
@@ -346,7 +425,7 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
       },
       transform: {
         filter: {
-          id: /\.(css|less|sass|scss)(\?.*)?$/,
+          id: CSS_LANG_REG,
         },
         handler(_code, id) {
           if (server) {
@@ -361,7 +440,7 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
             let item: EnvironmentModuleNode | undefined;
             while ((item = queue.pop()) !== undefined) {
               if (item.file !== null) {
-                const normalized = path.normalize(item.file);
+                const normalized = toPosix(path.normalize(item.file));
                 const name = routeFileToName.get(normalized);
 
                 if (name !== undefined) {
@@ -395,7 +474,7 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
         filter: {
           id: /^fresh-island::.*/,
         },
-        handler(id) {
+        async handler(id) {
           let name = id.slice("fresh-island::".length);
 
           if (JS_REG.test(name)) {
@@ -403,7 +482,12 @@ export function serverSnapshot(options: ResolvedFreshViteConfig): Plugin[] {
           }
 
           const spec = islandSpecByName.get(name);
-          if (spec !== undefined) return spec;
+          if (spec !== undefined) {
+            // Re-resolve through the plugin pipeline so deno-specifiers
+            // (jsr:, https:) are handled correctly.
+            const resolved = await this.resolve(spec);
+            return resolved ?? spec;
+          }
         },
       },
     },
@@ -460,19 +544,19 @@ export default ${JSON.stringify(route.css)}
           const manifest = JSON.parse(asset.source as string) as Manifest;
 
           for (const info of Object.values(manifest)) {
-            if (info.name?.startsWith("_fresh-route___")) {
-              const filePath = path.join(serverOutDir, info.file);
-              const content = await Deno.readTextFile(filePath);
+            // Utility-file(_app/_layout/_error)'s CSS can be hoisted into
+            // shared chunks like "server-entry", not just route chunks.
+            // Replace placeholders in any emitted JS chunk that contains one.
+            if (!/\.(?:c|m)?js$/.test(info.file)) continue;
 
-              const replaced = content.replace(
-                `["__FRESH_CSS_PLACEHOLDER__"]`,
-                info.css
-                  ? JSON.stringify(info.css.map((css) => `/${css}`))
-                  : "null",
-              );
+            const filePath = path.join(serverOutDir, info.file);
+            const content = await Deno.readTextFile(filePath);
+            if (!content.includes(FRESH_CSS_PLACEHOLDER)) continue;
 
-              await Deno.writeTextFile(filePath, replaced);
-            }
+            // Replace all placeholders in the file with the CSS
+            const replaced = replaceFreshCssPlaceholders(content, info.css);
+
+            await Deno.writeTextFile(filePath, replaced);
           }
         }
       },

@@ -11,11 +11,18 @@ export interface FileSnapshot {
   filePath: string;
   hash: string | null;
   contentType: string;
+  immutable?: boolean;
 }
 
 export interface BuildSnapshot<State> {
   version: string;
   clientEntry: string;
+  /**
+   * When defined, forces the boot script to be emitted in dev so HMR
+   * listeners attach even on island-free pages. The value itself is
+   * currently unused — only its presence matters. Undefined outside of dev.
+   */
+  hmrClientEntry?: string;
   fsRoutes: FsRouteFile<State>[];
   staticFiles: Map<string, FileSnapshot>;
   islands: ServerIslandRegistry;
@@ -28,6 +35,7 @@ export interface StaticFile {
   contentType: string;
   readable: ReadableStream<Uint8Array> | Uint8Array;
   close(): void;
+  immutable?: boolean;
 }
 
 // deno-lint-ignore no-explicit-any
@@ -35,6 +43,8 @@ export interface BuildCache<State = any> {
   root: string;
   islandRegistry: ServerIslandRegistry;
   clientEntry: string;
+  /** Pathname for the HMR-only chunk (development only). Undefined in production. */
+  hmrClientEntry?: string;
   features: {
     errorOverlay: boolean;
   };
@@ -47,6 +57,7 @@ export class ProdBuildCache<State> implements BuildCache<State> {
   #snapshot: BuildSnapshot<State>;
   islandRegistry: ServerIslandRegistry;
   clientEntry: string;
+  hmrClientEntry: string | undefined;
   features = { errorOverlay: false };
 
   constructor(public root: string, snapshot: BuildSnapshot<State>) {
@@ -54,6 +65,7 @@ export class ProdBuildCache<State> implements BuildCache<State> {
     this.#snapshot = snapshot;
     this.islandRegistry = snapshot.islands;
     this.clientEntry = snapshot.clientEntry;
+    this.hmrClientEntry = snapshot.hmrClientEntry;
   }
 
   getEntryAssets(): string[] {
@@ -85,6 +97,7 @@ export class ProdBuildCache<State> implements BuildCache<State> {
       size: stat.size,
       readable: file.readable,
       close: () => file.close(),
+      immutable: info.immutable,
     };
   }
 }

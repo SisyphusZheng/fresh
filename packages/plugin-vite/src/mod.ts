@@ -5,6 +5,7 @@ import {
   type ResolvedFreshViteConfig,
 } from "./utils.ts";
 import { deno } from "./plugins/deno.ts";
+
 import prefresh from "@prefresh/vite";
 import { serverEntryPlugin } from "./plugins/server_entry.ts";
 import { clientEntryPlugin } from "./plugins/client_entry.ts";
@@ -54,11 +55,13 @@ export type {
  * ```
  */
 export function fresh(config?: FreshViteConfig): Plugin[] {
+  const rawStaticDir = config?.staticDir ?? "static";
   const fConfig: ResolvedFreshViteConfig = {
     serverEntry: config?.serverEntry ?? "main.ts",
     clientEntry: config?.clientEntry ?? "client.ts",
     islandsDir: config?.islandsDir ?? "islands",
     routeDir: config?.routeDir ?? "routes",
+    staticDir: Array.isArray(rawStaticDir) ? rawStaticDir : [rawStaticDir],
     ignore: config?.ignore ?? [TEST_FILE_PATTERN],
     islandSpecifiers: new Map(),
     namer: new UniqueNamer(),
@@ -88,6 +91,23 @@ export function fresh(config?: FreshViteConfig): Plugin[] {
         isDev = env.command === "serve";
 
         return {
+          server: {
+            watch: {
+              // Ignore temp files, editor swap files, and Vite timestamp
+              // files. On Linux, these short-lived files can trigger a
+              // watchFs race condition in Deno where the watcher tries to
+              // open a file that has already been deleted, crashing the
+              // dev server with ENOENT.
+              ignored: [
+                "**/*.tmp.*",
+                "**/*.timestamp-*",
+                "**/*~",
+                "**/.#*",
+                "**/*.swp",
+                "**/*.swo",
+              ],
+            },
+          },
           esbuild: {
             jsx: "automatic",
             jsxImportSource: "preact",
@@ -110,7 +130,7 @@ export function fresh(config?: FreshViteConfig): Plugin[] {
             noDiscovery: true,
           },
 
-          publicDir: pathWithRoot("static", config.root),
+          publicDir: pathWithRoot(fConfig.staticDir[0], config.root),
 
           builder: {
             async buildApp(builder) {
@@ -207,6 +227,9 @@ export function fresh(config?: FreshViteConfig): Plugin[] {
 
         fConfig.islandsDir = pathWithRoot(fConfig.islandsDir, vConfig.root);
         fConfig.routeDir = pathWithRoot(fConfig.routeDir, vConfig.root);
+        fConfig.staticDir = fConfig.staticDir.map((d) =>
+          pathWithRoot(d, vConfig.root)
+        );
 
         config?.islandSpecifiers?.map((spec) => {
           const specName = specToName(spec);
@@ -232,7 +255,7 @@ export function fresh(config?: FreshViteConfig): Plugin[] {
     clientEntryPlugin(fConfig),
     ...clientSnapshot(fConfig),
     buildIdPlugin(),
-    ...devServer(),
+    ...devServer(fConfig),
     prefresh({
       include: [/\.[cm]?[tj]sx?$/],
       exclude: [/node_modules/, /[\\/]+deno[\\/]+npm[\\/]+/],

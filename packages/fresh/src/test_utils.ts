@@ -7,6 +7,7 @@ import { DEFAULT_CONN_INFO } from "./app.ts";
 import type { Command } from "./commands.ts";
 import { fsItemsToCommands, type FsRouteFile } from "./fs_routes.ts";
 import * as path from "@std/path";
+import { toPosix } from "./dev/dev_build_cache.ts";
 
 const STUB = {} as unknown as Deno.ServeHandlerInfo;
 
@@ -67,6 +68,7 @@ const DEFAULT_CONFIG: ResolvedFreshConfig = {
   root: "",
   mode: "production",
   basePath: "",
+  trustProxy: false,
 };
 
 export function serveMiddleware<T>(
@@ -122,7 +124,10 @@ export function createFakeFs(files: Record<string, unknown>): FsAdapter {
     },
     // deno-lint-ignore require-await
     async isDirectory(dir) {
-      return Object.keys(files).some((file) => file.startsWith(dir + "/"));
+      return Object.keys(files).some((file) =>
+        // normalize path to posix before comparing
+        toPosix(file).startsWith(dir + "/")
+      );
     },
     async mkdirp(_dir: string) {
     },
@@ -180,6 +185,26 @@ export class MockBuildCache<State> implements BuildCache<State> {
   readFile(_pathname: string): Promise<StaticFile | null> {
     return Promise.resolve(null);
   }
+}
+
+/**
+ * Wrapper around `Deno.test` for integration tests that disables sanitizers.
+ * Accepts either a name string or an options object (without `fn`), plus the
+ * test function.
+ */
+export function integrationTest(
+  nameOrOptions: string | Omit<Deno.TestDefinition, "fn">,
+  fn: () => void | Promise<void>,
+): void {
+  const options = typeof nameOrOptions === "string"
+    ? { name: nameOrOptions }
+    : nameOrOptions;
+  Deno.test({
+    ...options,
+    fn,
+    sanitizeOps: false,
+    sanitizeResources: false,
+  });
 }
 
 export async function writeFiles(dir: string, files: Record<string, string>) {

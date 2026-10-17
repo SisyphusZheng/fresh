@@ -1,7 +1,10 @@
-import { setAdditionalStyles } from "./context.ts";
 import { HttpError } from "./error.ts";
 import { isHandlerByMethod, type PageResponse } from "./handlers.ts";
-import type { MaybeLazyMiddleware, Middleware } from "./middlewares/mod.ts";
+import {
+  compileMiddlewares,
+  type MaybeLazyMiddleware,
+  type Middleware,
+} from "./middlewares/mod.ts";
 import { mergePath, type Method, type Router, toRoutePath } from "./router.ts";
 import {
   getOrCreateSegment,
@@ -70,11 +73,13 @@ export function newErrorCmd<State>(
 export interface AppCommand<State> {
   type: CommandType.App;
   component: RouteComponent<State>;
+  css?: string[];
 }
 export function newAppCmd<State>(
   component: RouteComponent<State>,
+  css?: string[],
 ): AppCommand<State> {
-  return { type: CommandType.App, component };
+  return { type: CommandType.App, component, css };
 }
 
 export interface LayoutCommand<State> {
@@ -82,6 +87,7 @@ export interface LayoutCommand<State> {
   pattern: string;
   component: RouteComponent<State>;
   config?: LayoutConfig;
+  css?: string[];
   includeLastSegment: boolean;
 }
 export function newLayoutCmd<State>(
@@ -89,12 +95,14 @@ export function newLayoutCmd<State>(
   component: RouteComponent<State>,
   config: LayoutConfig | undefined,
   includeLastSegment: boolean,
+  css?: string[],
 ): LayoutCommand<State> {
   return {
     type: CommandType.Layout,
     pattern,
     component,
     config,
+    css,
     includeLastSegment,
   };
 }
@@ -202,22 +210,25 @@ export type Command<State> =
   | FsRouteCommand<State>;
 
 export function applyCommands<State>(
-  router: Router<MaybeLazyMiddleware<State>>,
+  router: Router<Middleware<State>>,
   commands: Command<State>[],
   basePath: string,
-): { rootMiddlewares: MaybeLazyMiddleware<State>[] } {
+  onError?: (err: unknown) => void,
+): { rootHandler: Middleware<State> } {
   const root = newSegment<State>("", null);
 
-  applyCommandsInner(root, router, commands, basePath);
+  applyCommandsInner(root, router, commands, basePath, onError);
 
-  return { rootMiddlewares: segmentToMiddlewares(root) };
+  const rootMiddlewares = segmentToMiddlewares(root);
+  return { rootHandler: compileMiddlewares(rootMiddlewares, onError) };
 }
 
 function applyCommandsInner<State>(
   root: Segment<State>,
-  router: Router<MaybeLazyMiddleware<State>>,
+  router: Router<Middleware<State>>,
   commands: Command<State>[],
   basePath: string,
+  onError?: (err: unknown) => void,
 ) {
   for (let i = 0; i < commands.length; i++) {
     const cmd = commands[i];
@@ -246,7 +257,7 @@ function applyCommandsInner<State>(
         break;
       }
       case CommandType.App: {
-        root.app = cmd.component;
+        root.app = { component: cmd.component, css: cmd.css ?? null };
         break;
       }
       case CommandType.Layout: {
@@ -258,6 +269,7 @@ function applyCommandsInner<State>(
         segment.layout = {
           component: cmd.component,
           config: cmd.config ?? null,
+          css: cmd.css ?? null,
         };
         break;
       }
@@ -283,25 +295,22 @@ function applyCommandsInner<State>(
               def = await route();
             }
 
-            if (def.css !== undefined) {
-              setAdditionalStyles(ctx, def.css);
-            }
-
             return renderRoute(ctx, def);
           });
 
+          const compiled = compileMiddlewares(fns, onError);
           if (config === undefined || config.methods === "ALL") {
-            router.add("GET", routePath, fns);
-            router.add("DELETE", routePath, fns);
-            router.add("HEAD", routePath, fns);
-            router.add("OPTIONS", routePath, fns);
-            router.add("PATCH", routePath, fns);
-            router.add("POST", routePath, fns);
-            router.add("PUT", routePath, fns);
+            router.add("GET", routePath, compiled);
+            router.add("DELETE", routePath, compiled);
+            router.add("HEAD", routePath, compiled);
+            router.add("OPTIONS", routePath, compiled);
+            router.add("PATCH", routePath, compiled);
+            router.add("POST", routePath, compiled);
+            router.add("PUT", routePath, compiled);
           } else if (Array.isArray(config.methods)) {
             for (let i = 0; i < config.methods.length; i++) {
               const method = config.methods[i];
-              router.add(method, routePath, fns);
+              router.add(method, routePath, compiled);
             }
           }
         } else {
@@ -313,17 +322,18 @@ function applyCommandsInner<State>(
             false,
           ));
 
+          const compiled = compileMiddlewares(fns, onError);
           if (typeof route.handler === "function") {
-            router.add("GET", routePath, fns);
-            router.add("DELETE", routePath, fns);
-            router.add("HEAD", routePath, fns);
-            router.add("OPTIONS", routePath, fns);
-            router.add("PATCH", routePath, fns);
-            router.add("POST", routePath, fns);
-            router.add("PUT", routePath, fns);
+            router.add("GET", routePath, compiled);
+            router.add("DELETE", routePath, compiled);
+            router.add("HEAD", routePath, compiled);
+            router.add("OPTIONS", routePath, compiled);
+            router.add("PATCH", routePath, compiled);
+            router.add("POST", routePath, compiled);
+            router.add("PUT", routePath, compiled);
           } else if (isHandlerByMethod(route.handler!)) {
             for (const method of Object.keys(route.handler)) {
-              router.add(method as Method, routePath, fns);
+              router.add(method as Method, routePath, compiled);
             }
           }
         }
@@ -340,17 +350,18 @@ function applyCommandsInner<State>(
 
         result.push(...fns);
 
+        const compiled = compileMiddlewares(result, onError);
         const resPath = toRoutePath(mergePath(basePath, pattern, false));
         if (method === "ALL") {
-          router.add("GET", resPath, result);
-          router.add("DELETE", resPath, result);
-          router.add("HEAD", resPath, result);
-          router.add("OPTIONS", resPath, result);
-          router.add("PATCH", resPath, result);
-          router.add("POST", resPath, result);
-          router.add("PUT", resPath, result);
+          router.add("GET", resPath, compiled);
+          router.add("DELETE", resPath, compiled);
+          router.add("HEAD", resPath, compiled);
+          router.add("OPTIONS", resPath, compiled);
+          router.add("PATCH", resPath, compiled);
+          router.add("POST", resPath, compiled);
+          router.add("PUT", resPath, compiled);
         } else {
-          router.add(method, resPath, result);
+          router.add(method, resPath, compiled);
         }
 
         break;
@@ -358,7 +369,7 @@ function applyCommandsInner<State>(
       case CommandType.FsRoute: {
         const items = cmd.getItems();
         const base = mergePath(basePath, cmd.pattern, true);
-        applyCommandsInner(root, router, items, base);
+        applyCommandsInner(root, router, items, base, onError);
         break;
       }
       default:

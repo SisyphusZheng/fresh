@@ -1,10 +1,16 @@
 import type { DevEnvironment, Plugin } from "vite";
 import * as path from "@std/path";
-import { ASSET_CACHE_BUST_KEY } from "fresh/internal";
+import { contentType as getStdContentType } from "@std/media-types/content-type";
+import { ASSET_CACHE_BUST_KEY, upgradeSourceMap } from "fresh/internal";
 import { createRequest, sendResponse } from "@remix-run/node-fetch-server";
 import { hashCode } from "../shared.ts";
+import type { ResolvedFreshViteConfig } from "../utils.ts";
 
-export function devServer(): Plugin[] {
+function getContentType(ext: string): string {
+  return getStdContentType(ext) ?? "application/octet-stream";
+}
+
+export function devServer(freshConfig: ResolvedFreshViteConfig): Plugin[] {
   let publicDir = "";
   return [
     {
@@ -14,7 +20,82 @@ export function devServer(): Plugin[] {
         publicDir = config.publicDir;
       },
       configureServer(server) {
-        const IGNORE_URLS = /^\/(@(vite|fs|id)|\.vite)\//;
+        // Build the ignore pattern accounting for the configured base path.
+        // Vite prefixes virtual module URLs with the base (e.g. /ui/@id/...),
+        // so we need to match both /@ and /base/@.
+        const base = server.config.base.replace(/\/$/, "");
+        const IGNORE_URLS = new RegExp(
+          `^(${base})?/(@(vite|fs|id)|\\.vite)/`,
+        );
+
+        // WebSocket upgrade requests don't flow through Connect middleware —
+        // node:http dispatches them as `upgrade` events on the http.Server.
+        // Vite's own HMR server identifies its connections via the
+        // `sec-websocket-protocol` header (`vite-hmr`/`vite-ping`), so we
+        // skip those and let Vite handle them. Everything else we route into
+        // the Fresh handler with the raw socket + head stashed in
+        // `upgradeSourceMap` so `ctx.upgrade()` can finish the handshake via
+        // `Deno.upgradeWebSocket(req, { socket, head })`.
+        server.httpServer?.on("upgrade", (nodeReq, nodeSocket, head) => {
+          const protocolHeader = nodeReq.headers["sec-websocket-protocol"];
+          if (
+            typeof protocolHeader === "string" &&
+            /\b(vite-hmr|vite-ping)\b/.test(protocolHeader)
+          ) {
+            return;
+          }
+
+          (async () => {
+            try {
+              const serverCfg = server.config.server;
+              const protocol = serverCfg.https ? "https" : "http";
+              const host = nodeReq.headers.host ?? "localhost";
+              const url = new URL(
+                nodeReq.url ?? "/",
+                `${protocol}://${host}`,
+              );
+
+              const headers = new Headers();
+              for (const [key, value] of Object.entries(nodeReq.headers)) {
+                if (value === undefined || value === null) continue;
+                if (Array.isArray(value)) {
+                  for (const v of value) {
+                    if (typeof v === "string") headers.append(key, v);
+                  }
+                } else if (typeof value === "string") {
+                  headers.set(key, value);
+                }
+              }
+
+              const req = new Request(url, {
+                method: nodeReq.method ?? "GET",
+                headers,
+              });
+
+              upgradeSourceMap.set(req, { socket: nodeSocket, head });
+
+              const mod = await server.ssrLoadModule("fresh:server_entry");
+              mod.setErrorInterceptor((err: unknown) => {
+                if (err instanceof Error) server.ssrFixStacktrace(err);
+              });
+
+              await mod.default.fetch(req);
+              // If the handler called ctx.upgrade(), the 101 has already been
+              // written to nodeSocket and the WebSocket is live. If it didn't,
+              // we have no usable channel left to report an error on — close
+              // the socket so the client doesn't hang.
+              if (!nodeSocket.destroyed && upgradeSourceMap.has(req)) {
+                nodeSocket.destroy();
+              }
+              upgradeSourceMap.delete(req);
+            } catch (err) {
+              if (err instanceof Error) server.ssrFixStacktrace(err);
+              // deno-lint-ignore no-console
+              console.error("[fresh] WebSocket upgrade failed:", err);
+              if (!nodeSocket.destroyed) nodeSocket.destroy();
+            }
+          })();
+        });
 
         server.middlewares.use(async (nodeReq, nodeRes, next) => {
           const serverCfg = server.config.server;
@@ -29,9 +110,11 @@ export function devServer(): Plugin[] {
           // Don't cache in dev
           url.searchParams.delete(ASSET_CACHE_BUST_KEY);
 
-          // Check if it's a vite url
+          // Check if it's a vite url or a node_modules asset (e.g. fonts
+          // referenced from CSS in npm packages)
           if (
             IGNORE_URLS.test(url.pathname) ||
+            url.pathname.startsWith("/node_modules/") ||
             server.environments.client.moduleGraph.urlToModuleMap.has(
               url.pathname,
             ) ||
@@ -45,30 +128,55 @@ export function devServer(): Plugin[] {
 
           const decodedPathname = decodeURIComponent(url.pathname.slice(1));
 
-          // Check if it's a static file first
-          const staticFilePath = path.join(publicDir, decodedPathname);
-          try {
-            const stat = await Deno.stat(staticFilePath);
-            if (stat.isFile) {
-              return next();
+          // Check if it's a static file first.
+          // Vite handles publicDir (the first static dir) natively,
+          // but we also need to check extra static dirs.
+          const extraStaticDirs = freshConfig.staticDir.slice(1);
+          const allStaticDirs = [publicDir, ...extraStaticDirs];
+          let handledStatic = false;
+          for (const dir of allStaticDirs) {
+            const staticFilePath = path.join(dir, decodedPathname);
+            try {
+              const stat = await Deno.stat(staticFilePath);
+              if (stat.isFile) {
+                if (dir === publicDir) {
+                  // Vite serves publicDir files natively
+                  return next();
+                }
+                // Serve files from extra dirs manually
+                const file = await Deno.open(staticFilePath, { read: true });
+                const { ext } = path.parse(staticFilePath);
+                const contentType = getContentType(ext);
+                nodeRes.setHeader("Content-Type", contentType);
+                // deno-lint-ignore no-explicit-any
+                for await (const chunk of file.readable as any) {
+                  nodeRes.write(chunk);
+                }
+                nodeRes.end();
+                handledStatic = true;
+                break;
+              }
+            } catch {
+              // Ignore
             }
-          } catch {
-            // Ignore
           }
+          if (handledStatic) return;
 
           // Check if it's a static/index.html file
-          const staticFilePathIndex = path.join(
-            publicDir,
-            decodedPathname,
-            "index.html",
-          );
-          try {
-            const content = await Deno.readTextFile(staticFilePathIndex);
-            nodeRes.setHeader("Content-Type", "text/html; charset=utf-8");
-            nodeRes.end(content);
-            return;
-          } catch {
-            // Ignore
+          for (const dir of allStaticDirs) {
+            const staticFilePathIndex = path.join(
+              dir,
+              decodedPathname,
+              "index.html",
+            );
+            try {
+              const content = await Deno.readTextFile(staticFilePathIndex);
+              nodeRes.setHeader("Content-Type", "text/html; charset=utf-8");
+              nodeRes.end(content);
+              return;
+            } catch {
+              // Ignore
+            }
           }
 
           try {
@@ -89,10 +197,22 @@ export function devServer(): Plugin[] {
               url.pathname !== "/__inspect" &&
               res.headers.get("Content-Type")?.includes("text/html")
             ) {
+              const clientEnv = server.environments.client;
               const collected = await collectCss(
                 "fresh:client-entry",
-                server.environments.client,
+                clientEnv,
               );
+
+              // Also collect CSS from island modules. In dev mode,
+              // island css is [] so RemainingHead can't inject them.
+              // Walk all loaded modules that look like island entries
+              // to pick up their CSS module imports.
+              for (const mod of clientEnv.moduleGraph.idToModuleMap.values()) {
+                if (mod.id?.includes("fresh-island::")) {
+                  const islandCss = await collectCss(mod.id, clientEnv);
+                  collected.push(...islandCss);
+                }
+              }
 
               let html = await res.text();
 
